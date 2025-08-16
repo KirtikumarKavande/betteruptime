@@ -13,3 +13,9 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+model website{
+  id        String   @id @default(uuid())
+  url       String   @unique
+  timeAdded DateTime @default(now())  
+
+}

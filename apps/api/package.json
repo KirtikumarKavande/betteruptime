@@ -1,22 +1,20 @@
 {
-  "name": "@repo/db",
+  "name": "api",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "exports":{
-    "./client":"./index.ts"
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@prisma/client": "^6.14.0",
-    "@types/node": "^22.15.3"
+    "@types/express": "^5.0.3",
+    "express": "^5.1.0"
   },
   "devDependencies": {
-    "prisma": "^6.14.0"
+    "@repo/typescript-config":"workspace:*",
+    "@repo/db":"workspace:*"
   }
 }

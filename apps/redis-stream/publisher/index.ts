@@ -5,7 +5,7 @@ async function websitePublisher() {
   console.log("Starting website publisher");
   let client = await redisInstance();
 
-  // get all websites from db and put into queue
+  //info: get all websites from db and put into queue
 
   try {
     const websites = await prismaClient.website.findMany();

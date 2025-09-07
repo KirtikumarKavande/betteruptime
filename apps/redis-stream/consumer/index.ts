@@ -19,6 +19,7 @@ interface ConsumerManager {
   isScaling: boolean;
 }
 
+// Configuration
 const CONFIG = {
   maxRetries: 3,
   retryDelay: 1000,
@@ -27,14 +28,18 @@ const CONFIG = {
   scaleDownThreshold: 10,
   maxConsumers: 10,
   minConsumers: 1,
-  scaleInterval: 60000, 
-  blockTimeout: 5000
+  scaleInterval: 60000, // 1 minute
+  cleanupInterval: 60 * 60 * 1000, // 1 hour
+  blockTimeout: 5000,
+  streamCleanupThreshold: 1000,
+  cleanupBufferTime: 60 * 60 * 1000 // 1 hour buffer
 };
 
 class WebsiteMonitorConsumer {
   private managers = new Map<string, ConsumerManager>();
   private dbConsumerRunning = false;
   private shutdownSignal = new AbortController();
+  private cleanupIntervals = new Map<string, NodeJS.Timeout>();
 
   constructor() {
     this.setupGracefulShutdown();
@@ -57,10 +62,11 @@ class WebsiteMonitorConsumer {
       // Start DB consumer once
       this.startDbConsumer();
 
-      // Start scaling and consuming for each group
+      // Start scaling, consuming, and cleanup for each group
       for (const groupName of groups) {
         await this.scaleConsumer(groupName);
         this.startPeriodicScaling(groupName);
+        this.startCleanupProcess(groupName);
       }
     } finally {
       await client.quit();
@@ -372,9 +378,92 @@ class WebsiteMonitorConsumer {
     });
   }
 
+  private startCleanupProcess(groupName: string) {
+    // Prevent multiple cleanup processes for the same group
+    if (this.cleanupIntervals.has(groupName)) {
+      console.log(`Cleanup already running for group ${groupName}`);
+      return;
+    }
+
+    const interval = setInterval(
+      async () => {
+        if (this.shutdownSignal.signal.aborted) {
+          this.stopCleanupProcess(groupName);
+          return;
+        }
+        await this.runCleanupForGroup(groupName);
+      },
+      CONFIG.cleanupInterval
+    );
+
+    this.cleanupIntervals.set(groupName, interval);
+    console.log(`🧹 Started cleanup process for group ${groupName}`);
+  }
+
+  private stopCleanupProcess(groupName: string) {
+    const interval = this.cleanupIntervals.get(groupName);
+    if (interval) {
+      clearInterval(interval);
+      this.cleanupIntervals.delete(groupName);
+      console.log(`🛑 Stopped cleanup process for group ${groupName}`);
+    }
+  }
+
+  private async runCleanupForGroup(groupName: string) {
+    const client = await redisInstance();
+    
+    try {
+      console.log(` Starting cleanup for group ${groupName}`);
+      
+      const [streamLength, groupInfo] = await Promise.all([
+        client.xLen(websiteStream),
+        client.xInfoGroups(websiteStream),
+      ]);
+
+      const ourGroup = groupInfo.find((item: any) => item.name === groupName);
+      if (!ourGroup) {
+        console.error(`Group ${groupName} not found during cleanup`);
+        return;
+      }
+
+      // Only cleanup if stream is large enough
+      if (streamLength <= CONFIG.streamCleanupThreshold) {
+        console.log(` Stream length (${streamLength}) below cleanup threshold (${CONFIG.streamCleanupThreshold})`);
+        return;
+      }
+
+      // Check if group has processed any messages
+      if (ourGroup["last-delivered-id"] === "0-0") {
+        console.log(`Group ${groupName} hasn't processed any messages yet, skipping cleanup`);
+        return;
+      }
+
+      // Calculate safe cleanup point
+      const lastDeliveredTimestamp = parseInt(ourGroup["last-delivered-id"].split("-")[0]);
+      const safeCleanupTimestamp = lastDeliveredTimestamp - CONFIG.cleanupBufferTime;
+      const safeStreamId = `${safeCleanupTimestamp}-0`;
+
+      try {
+        const trimmed = await client.xTrim(websiteStream, "MINID", safeStreamId);
+        
+        if (trimmed > 0) {
+          console.log(`✅ Successfully trimmed ${trimmed} old messages from stream for group ${groupName}`);
+        } else {
+          console.log(`ℹ️ No messages were trimmed for group ${groupName} - all messages are within buffer time`);
+        }
+      } catch (trimError) {
+        console.error(`Could not trim stream for group ${groupName}:`, trimError);
+      }
+    } catch (error) {
+      console.error(`Error during cleanup for group ${groupName}:`, error);
+    } finally {
+      await client.quit();
+    }
+  }
+
   private setupGracefulShutdown() {
     const shutdown = async () => {
-      console.log("🛑 Shutting down gracefully...");
+      console.log("Shutting down gracefully...");
       this.shutdownSignal.abort();
       
       // Stop all consumers
@@ -384,6 +473,11 @@ class WebsiteMonitorConsumer {
         }
       }
       
+      // Stop all cleanup processes
+      for (const groupName of this.cleanupIntervals.keys()) {
+        this.stopCleanupProcess(groupName);
+      }
+      
       // Wait a bit for cleanup
       await this.sleep(2000);
       process.exit(0);
@@ -391,19 +485,18 @@ class WebsiteMonitorConsumer {
 
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
+    process.on('SIGQUIT', shutdown); // Additional signal for completeness
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
-
-  
 }
 
 // Usage
 const monitor = new WebsiteMonitorConsumer();
 monitor.initialize(['INDIA'])
-  .then(() => console.log("✅ Website monitor initialized"))
+  .then(() => console.log("Website monitor initialized with cleanup process"))
   .catch(error => {
     console.error("❌ Failed to initialize:", error);
     process.exit(1);

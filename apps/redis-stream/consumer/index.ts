@@ -4,12 +4,18 @@ import axios, { AxiosError } from "axios";
 
 // Types
 interface Website {
+  id?: string;
   url: string;
-  time_added: Date;
+  time_added?: Date;
+}
+
+enum status {
+  "Up" = "Up",
+  "Down" = "Down",
 }
 
 interface WebsiteWithStatus extends Website {
-  status?: 'Up' | 'Down';
+  status?: status.Down | status.Up;
   error_message?: string;
 }
 
@@ -17,6 +23,11 @@ interface ConsumerManager {
   groupName: string;
   consumers: Map<string, AbortController>;
   isScaling: boolean;
+}
+
+interface webStatusPromise {
+  status: string;
+  value: WebsiteWithStatus;
 }
 
 // Configuration
@@ -32,7 +43,7 @@ const CONFIG = {
   cleanupInterval: 60 * 60 * 1000, // 1 hour
   blockTimeout: 5000,
   streamCleanupThreshold: 1000,
-  cleanupBufferTime: 60 * 60 * 1000 // 1 hour buffer
+  cleanupBufferTime: 60 * 60 * 1000, // 1 hour buffer
 };
 
 class WebsiteMonitorConsumer {
@@ -47,7 +58,7 @@ class WebsiteMonitorConsumer {
 
   async initialize(groups: string[]) {
     const client = await redisInstance();
-    
+
     try {
       // Create consumer groups
       for (const groupName of groups) {
@@ -55,7 +66,7 @@ class WebsiteMonitorConsumer {
         this.managers.set(groupName, {
           groupName,
           consumers: new Map(),
-          isScaling: false
+          isScaling: false,
         });
       }
 
@@ -117,7 +128,9 @@ class WebsiteMonitorConsumer {
       const desiredConsumers = this.calculateDesiredConsumers(unprocessedCount);
       const currentConsumers = manager.consumers.size;
 
-      console.log(`📊 Group: ${groupName}, Unprocessed: ${unprocessedCount}, Current: ${currentConsumers}, Desired: ${desiredConsumers}`);
+      console.log(
+        `📊 Group: ${groupName}, Unprocessed: ${unprocessedCount}, Current: ${currentConsumers}, Desired: ${desiredConsumers}`
+      );
 
       if (desiredConsumers > currentConsumers) {
         await this.scaleUp(manager, desiredConsumers - currentConsumers);
@@ -133,8 +146,10 @@ class WebsiteMonitorConsumer {
   }
 
   private calculateDesiredConsumers(unprocessedCount: number): number {
-    if (unprocessedCount > CONFIG.scaleUpThreshold) return Math.min(5, CONFIG.maxConsumers);
-    if (unprocessedCount > CONFIG.scaleDownThreshold) return Math.min(3, CONFIG.maxConsumers);
+    if (unprocessedCount > CONFIG.scaleUpThreshold)
+      return Math.min(5, CONFIG.maxConsumers);
+    if (unprocessedCount > CONFIG.scaleDownThreshold)
+      return Math.min(3, CONFIG.maxConsumers);
     return CONFIG.minConsumers;
   }
 
@@ -168,22 +183,28 @@ class WebsiteMonitorConsumer {
     for (let i = 0; i < count; i++) {
       const consumerId = `consumer-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
       const abortController = new AbortController();
-      
+
       manager.consumers.set(consumerId, abortController);
-      
+
       // Start consumer without awaiting (fire and forget)
-      this.startConsumer(manager.groupName, consumerId, abortController.signal)
-        .catch(error => {
-          console.error(`❌ Consumer ${consumerId} failed:`, error);
-          manager.consumers.delete(consumerId);
-        });
+      this.startConsumer(
+        manager.groupName,
+        consumerId,
+        abortController.signal
+      ).catch((error) => {
+        console.error(`❌ Consumer ${consumerId} failed:`, error);
+        manager.consumers.delete(consumerId);
+      });
     }
     console.log(`📈 Scaled up ${manager.groupName} by ${count} consumers`);
   }
 
   private async scaleDown(manager: ConsumerManager, count: number) {
-    const consumersToRemove = Array.from(manager.consumers.entries()).slice(0, count);
-    
+    const consumersToRemove = Array.from(manager.consumers.entries()).slice(
+      0,
+      count
+    );
+
     for (const [consumerId, controller] of consumersToRemove) {
       controller.abort();
       manager.consumers.delete(consumerId);
@@ -197,7 +218,6 @@ class WebsiteMonitorConsumer {
     signal: AbortSignal
   ) {
     const client = await redisInstance();
-    console.log(`🚀 Starting consumer ${consumerId} for group ${groupName}`);
 
     try {
       while (!signal.aborted && !this.shutdownSignal.signal.aborted) {
@@ -206,15 +226,15 @@ class WebsiteMonitorConsumer {
             groupName,
             consumerId,
             [{ key: websiteStream, id: ">" }],
-            { 
-              COUNT: 1, 
-              BLOCK: CONFIG.blockTimeout 
+            {
+              COUNT: 10,
+              BLOCK: CONFIG.blockTimeout,
             }
           );
 
           if (res && res.length > 0) {
             const messages = res[0].messages;
-            await this.processMessages(messages, client, groupName);
+            await this.checkWebsiteStatus(messages, client, groupName);
           }
         } catch (error) {
           if (signal.aborted) break;
@@ -228,97 +248,97 @@ class WebsiteMonitorConsumer {
     }
   }
 
-  private async processMessages(messages: any[], client: any, groupName: string) {
-    for (const message of messages) {
-      const { id: messageId, message: websiteData } = message;
-      
-      if (websiteData) {
-        await this.checkWebsiteStatus(websiteData, messageId, client, groupName);
-      }
+
+  async removeMessageFromStream(
+    websiteStream: string,
+    client: any,
+    groupName: string,
+    messageId: string
+  ) {
+    try {
+      await client.xAck(websiteStream, groupName, messageId);
+    } catch (error) {
+      console.error(`❌ Failed to acknowledge message ${messageId}:`, error);
     }
   }
-
   private async checkWebsiteStatus(
-    website: Website,
-    messageId: string,
+    messages: any[],
     client: any,
     groupName: string
   ) {
-    let websiteWithStatus: WebsiteWithStatus = { ...website };
-    let shouldAck = false;
+    const res = messages.map(async (message) => {
+      const { id: messageId, message: websiteData } = message;
 
-    try {
-      console.log(`🔍 Checking website: ${website.url}`);
-      
-      const response = await this.makeRequest(website.url);
-      
-      if (response.status === 200) {
-        websiteWithStatus.status = 'Up';
-        shouldAck = true;
-        console.log(`✅ Website ${website.url} is up`);
-      }
-    } catch (error) {
-      console.log(`❌ Website ${website.url} is down:`, error);
-      websiteWithStatus.status = 'Down';
-      
-      if (error instanceof AxiosError) {
-        websiteWithStatus.error_message = error.message;
-      }
-      
-      // Still acknowledge the message to prevent reprocessing
-      shouldAck = true;
-    }
-
-    // Add to DB queue
-    try {
-      await client.xAdd(dbQueue, "*", {
-        ...websiteWithStatus,
-        time_added: new Date(websiteWithStatus.time_added).toISOString(),
-        processed_at: new Date().toISOString()
-      });
-      console.log(`📝 Added to DB queue: ${website.url}`);
-    } catch (error) {
-      console.error(`❌ Failed to add to DB queue:`, error);
-      shouldAck = false; // Don't ack if we couldn't queue for DB
-    }
-
-    // Acknowledge message
-    if (shouldAck) {
       try {
-        await client.xAck(websiteStream, groupName, messageId);
+        if (websiteData) {
+          await this.makeRequest(websiteData.url);
+        }
+        return {
+          id: websiteData.id,
+          url: websiteData.url,
+          status: status.Up,
+        };
       } catch (error) {
-        console.error(`❌ Failed to acknowledge message ${messageId}:`, error);
+        return {
+          id: websiteData.id,
+          url: websiteData.url,
+          status: status.Down,
+        };
+      } finally {
+        this.removeMessageFromStream(
+          websiteStream,
+          client,
+          groupName,
+          messageId
+        );
       }
-    }
+    });
+
+    const response: PromiseSettledResult<WebsiteWithStatus>[] =
+      await Promise.allSettled(res);
+
+    response.forEach(async (item) => {
+      if (item.status === "fulfilled") {
+        try {
+          await client.xAdd(dbQueue, "*", {
+            ...item.value,
+            processed_at: new Date().toISOString(),
+          });
+        } catch (error) {
+          console.error(`❌ Failed to add to DB queue:`, error);
+        }
+      }
+    });
   }
 
   private async makeRequest(url: string, retries = 0): Promise<any> {
     try {
-      return await axios.get(url, {
-        timeout: CONFIG.requestTimeout,
-        validateStatus: status => status < 500 // Don't retry 4xx errors
+      return axios.get(url, {
+        // timeout: CONFIG.requestTimeout,
+        // validateStatus: status => status < 500 // Don't retry 4xx errors
       });
     } catch (error) {
-      if (retries < CONFIG.maxRetries && this.isRetryableError(error)) {
-        console.log(`🔄 Retrying ${url} (attempt ${retries + 1})`);
-        await this.sleep(CONFIG.retryDelay * Math.pow(2, retries)); // Exponential backoff
-        return this.makeRequest(url, retries + 1);
-      }
+      // if (retries < CONFIG.maxRetries && this.isRetryableError(error)) {
+      //   console.log(`🔄 Retrying ${url} (attempt ${retries + 1})`);
+      //   await this.sleep(CONFIG.retryDelay * Math.pow(2, retries)); // Exponential backoff
+      //   return this.makeRequest(url, retries + 1);
+      // }
       throw error;
     }
   }
 
   private isRetryableError(error: any): boolean {
-    if (error.code === 'ECONNABORTED') return false; // Timeout
-    if (error.response?.status >= 400 && error.response?.status < 500) return false; // Client errors
+    if (error.code === "ECONNABORTED") return false; // Timeout
+    if (error.response?.status >= 400 && error.response?.status < 500)
+      return false; // Client errors
     return true; // Network errors, 5xx errors
   }
 
   private startDbConsumer() {
     if (this.dbConsumerRunning) return;
-    
+
     this.dbConsumerRunning = true;
-    this.runDbConsumer().catch(error => {
+    this.runDbConsumer().catch((error) => {
       console.error("❌ DB Consumer failed:", error);
       this.dbConsumerRunning = false;
     });
@@ -339,10 +359,10 @@ class WebsiteMonitorConsumer {
           if (result && result.length > 0) {
             const messages = result[0].messages;
             console.log(`📊 DB Consumer received ${messages.length} messages`);
-            
+
             // Process DB messages here
             for (const message of messages) {
-              console.log("DB Message:", message);
+              console.log("clear", message);
               // TODO: Insert into actual database
             }
           }
@@ -364,7 +384,7 @@ class WebsiteMonitorConsumer {
         clearInterval(interval);
         return;
       }
-      
+
       try {
         await this.scaleConsumer(groupName);
       } catch (error) {
@@ -373,7 +393,7 @@ class WebsiteMonitorConsumer {
     }, CONFIG.scaleInterval);
 
     // Clean up on shutdown
-    this.shutdownSignal.signal.addEventListener('abort', () => {
+    this.shutdownSignal.signal.addEventListener("abort", () => {
       clearInterval(interval);
     });
   }
@@ -385,16 +405,13 @@ class WebsiteMonitorConsumer {
       return;
     }
 
-    const interval = setInterval(
-      async () => {
-        if (this.shutdownSignal.signal.aborted) {
-          this.stopCleanupProcess(groupName);
-          return;
-        }
-        await this.runCleanupForGroup(groupName);
-      },
-      CONFIG.cleanupInterval
-    );
+    const interval = setInterval(async () => {
+      if (this.shutdownSignal.signal.aborted) {
+        this.stopCleanupProcess(groupName);
+        return;
+      }
+      await this.runCleanupForGroup(groupName);
+    }, CONFIG.cleanupInterval);
 
     this.cleanupIntervals.set(groupName, interval);
     console.log(`🧹 Started cleanup process for group ${groupName}`);
@@ -411,10 +428,10 @@ class WebsiteMonitorConsumer {
 
   private async runCleanupForGroup(groupName: string) {
     const client = await redisInstance();
-    
+
     try {
       console.log(` Starting cleanup for group ${groupName}`);
-      
+
       const [streamLength, groupInfo] = await Promise.all([
         client.xLen(websiteStream),
         client.xInfoGroups(websiteStream),
@@ -428,31 +445,49 @@ class WebsiteMonitorConsumer {
 
       // Only cleanup if stream is large enough
       if (streamLength <= CONFIG.streamCleanupThreshold) {
-        console.log(` Stream length (${streamLength}) below cleanup threshold (${CONFIG.streamCleanupThreshold})`);
+        console.log(
+          ` Stream length (${streamLength}) below cleanup threshold (${CONFIG.streamCleanupThreshold})`
+        );
         return;
       }
 
       // Check if group has processed any messages
       if (ourGroup["last-delivered-id"] === "0-0") {
-        console.log(`Group ${groupName} hasn't processed any messages yet, skipping cleanup`);
+        console.log(
+          `Group ${groupName} hasn't processed any messages yet, skipping cleanup`
+        );
         return;
       }
 
       // Calculate safe cleanup point
-      const lastDeliveredTimestamp = parseInt(ourGroup["last-delivered-id"].split("-")[0]);
-      const safeCleanupTimestamp = lastDeliveredTimestamp - CONFIG.cleanupBufferTime;
+      const lastDeliveredTimestamp = parseInt(
+        ourGroup["last-delivered-id"].split("-")[0]
+      );
+      const safeCleanupTimestamp =
+        lastDeliveredTimestamp - CONFIG.cleanupBufferTime;
       const safeStreamId = `${safeCleanupTimestamp}-0`;
 
       try {
-        const trimmed = await client.xTrim(websiteStream, "MINID", safeStreamId);
-        
+        const trimmed = await client.xTrim(
+          websiteStream,
+          "MINID",
+          safeStreamId
+        );
+
         if (trimmed > 0) {
-          console.log(`✅ Successfully trimmed ${trimmed} old messages from stream for group ${groupName}`);
+          console.log(
+            `✅ Successfully trimmed ${trimmed} old messages from stream for group ${groupName}`
+          );
         } else {
-          console.log(`ℹ️ No messages were trimmed for group ${groupName} - all messages are within buffer time`);
+          console.log(
+            `ℹ️ No messages were trimmed for group ${groupName} - all messages are within buffer time`
+          );
         }
       } catch (trimError) {
-        console.error(`Could not trim stream for group ${groupName}:`, trimError);
+        console.error(
+          `Could not trim stream for group ${groupName}:`,
+          trimError
+        );
       }
     } catch (error) {
       console.error(`Error during cleanup for group ${groupName}:`, error);
@@ -465,39 +500,40 @@ class WebsiteMonitorConsumer {
     const shutdown = async () => {
       console.log("Shutting down gracefully...");
       this.shutdownSignal.abort();
-      
+
       // Stop all consumers
       for (const manager of this.managers.values()) {
         for (const controller of manager.consumers.values()) {
           controller.abort();
         }
       }
-      
+
       // Stop all cleanup processes
       for (const groupName of this.cleanupIntervals.keys()) {
         this.stopCleanupProcess(groupName);
       }
-      
+
       // Wait a bit for cleanup
       await this.sleep(2000);
       process.exit(0);
     };
 
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
-    process.on('SIGQUIT', shutdown); // Additional signal for completeness
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+    process.on("SIGQUIT", shutdown); // Additional signal for completeness
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
 // Usage
 const monitor = new WebsiteMonitorConsumer();
-monitor.initialize(['INDIA'])
+monitor
+  .initialize(["INDIA"])
   .then(() => console.log("Website monitor initialized with cleanup process"))
-  .catch(error => {
+  .catch((error) => {
     console.error("❌ Failed to initialize:", error);
     process.exit(1);
   });

@@ -397,6 +397,9 @@ class WebsiteMonitorConsumer {
         if (retry === 3) {
           throw error;
         }
+         // Exponential backoff with jitter
+        const delay = 100 * Math.pow(2, retry) + Math.random() * 100;
+        await this.sleep(delay);
 
         await this.addUpDownStatusToDB(message, retry + 1);
       }

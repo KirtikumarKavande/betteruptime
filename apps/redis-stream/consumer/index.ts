@@ -25,11 +25,6 @@ interface ConsumerManager {
   isScaling: boolean;
 }
 
-interface webStatusPromise {
-  status: string;
-  value: WebsiteWithStatus;
-}
-
 // Configuration
 const CONFIG = {
   maxRetries: 3,
@@ -51,6 +46,7 @@ class WebsiteMonitorConsumer {
   private dbConsumerRunning = false;
   private shutdownSignal = new AbortController();
   private cleanupIntervals = new Map<string, NodeJS.Timeout>();
+  private lastProcessedMessageIDforDBqueue = "0-0";
 
   constructor() {
     this.setupGracefulShutdown();
@@ -248,7 +244,6 @@ class WebsiteMonitorConsumer {
     }
   }
 
-
   async removeMessageFromStream(
     websiteStream: string,
     client: any,
@@ -268,21 +263,25 @@ class WebsiteMonitorConsumer {
   ) {
     const res = messages.map(async (message) => {
       const { id: messageId, message: websiteData } = message;
-
+      const requestTime = Date.now();
       try {
         if (websiteData) {
           await this.makeRequest(websiteData.url);
         }
+        const responseTime = Date.now();
+
         return {
           id: websiteData.id,
           url: websiteData.url,
           status: status.Up,
+          delay: String(responseTime - requestTime),
         };
       } catch (error) {
         return {
           id: websiteData.id,
           url: websiteData.url,
           status: status.Down,
+          delay: String(0),
         };
       } finally {
         this.removeMessageFromStream(
@@ -296,7 +295,6 @@ class WebsiteMonitorConsumer {
 
     const response: PromiseSettledResult<WebsiteWithStatus>[] =
       await Promise.allSettled(res);
-
     response.forEach(async (item) => {
       if (item.status === "fulfilled") {
         try {
@@ -351,20 +349,33 @@ class WebsiteMonitorConsumer {
     try {
       while (!this.shutdownSignal.signal.aborted) {
         try {
+          // await client.del(dbQueue);
+          // const result:any=[]
+          const messageIds: string[] = [];
+
           const result = await client.xRead(
-            { key: dbQueue, id: "$" },
-            { BLOCK: CONFIG.blockTimeout }
+            { key: dbQueue, id: "0-0" },
+            { BLOCK: CONFIG.blockTimeout, COUNT: 20 }
           );
 
           if (result && result.length > 0) {
             const messages = result[0].messages;
-            console.log(`📊 DB Consumer received ${messages.length} messages`);
+            console.log("whole message", messages);
 
-            // Process DB messages here
-            for (const message of messages) {
-              console.log("clear", message);
-              // TODO: Insert into actual database
-            }
+            const promiseResult = messages.map(async (item: any) => {
+              const { id: messageId, message } = item;
+              messageIds.push(messageId);
+              let retry = 1;
+              try {
+                return await this.addUpDownStatusToDB(message, retry);
+              } catch (error) {
+                console.log("error while marking UpDownStatusToDB", retry);
+              }
+            });
+
+            await Promise.allSettled(promiseResult);
+            await client.xDel(dbQueue, messageIds);
+            console.log("error while removing ids from dbQueue");
           }
         } catch (error) {
           if (this.shutdownSignal.signal.aborted) break;
@@ -375,6 +386,20 @@ class WebsiteMonitorConsumer {
     } finally {
       console.log("🛑 DB consumer stopped");
       await client.quit();
+    }
+  }
+
+  private async addUpDownStatusToDB(message: any, retry: number) {
+    if (retry <= 3) {
+      try {
+        // prisma call
+      } catch (error) {
+        if (retry === 3) {
+          throw error;
+        }
+
+        await this.addUpDownStatusToDB(message, retry + 1);
+      }
     }
   }
 
